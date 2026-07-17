@@ -733,9 +733,9 @@ class ChatPage(QWidget):
             def fetch_fn() -> list[str]:
                 return fetch_openai_models(api_key)
         else:
-
+            url = f"http://100.93.59.55:11434"
             def fetch_fn() -> list[str]:
-                return fetch_ollama_models(HYPER_OLLAMA_URL)
+                return fetch_ollama_models(url)
 
         def worker() -> None:
             try:

@@ -21,7 +21,7 @@ ROUTER_QUEUE = "router_queue"
 CLIENT_QUEUE = "client_queue"
 ROUTING_KEY = "router"
 SUPERVISOR_ROUTING_KEY = "supervisor"
-RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "100.93.59.55")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 DEFAULT_WORKDIR = pathlib.Path(os.getenv("CLIENT_WORKDIR", "workdir"))
 
