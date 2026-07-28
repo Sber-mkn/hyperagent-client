@@ -2,14 +2,23 @@ import json
 import logging
 import os
 import pathlib
+import platform
+import re
+import shutil
 import subprocess
 import threading
 import time
 import uuid
+from typing import Any
 
 import pika
 
-from client.core.client_state import ACCESS_ASK, ACCESS_FULL, ACCESS_READ_ONLY
+from client.core.client_state import (
+    ACCESS_ASK,
+    ACCESS_FULL,
+    ACCESS_READ_ONLY,
+    DEFAULT_RABBITMQ_PORT,
+)
 from client.core.rabbitmq_service import RabbitMQBase
 
 USER = "client"
@@ -21,28 +30,134 @@ ROUTER_QUEUE = "router_queue"
 CLIENT_QUEUE = "client_queue"
 ROUTING_KEY = "router"
 SUPERVISOR_ROUTING_KEY = "supervisor"
-RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "100.93.59.55")
-RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 DEFAULT_WORKDIR = pathlib.Path(os.getenv("CLIENT_WORKDIR", "workdir"))
+DEFAULT_COMMAND_TIMEOUT = 60
+DEFAULT_OUTPUT_LIMIT = 4000
+MAX_OUTPUT_CHARS = 20000
+# The GUI build has no console of its own, so Windows hands every console child
+# a brand new window — which flashes open and shut on the user's screen for each
+# command. Output is captured through pipes either way. Absent off Windows.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 logger = logging.getLogger(__name__)
 
 
+def _find_bash() -> str:
+    """A bare "bash" on Windows usually resolves to the WSL launcher, whose
+    filesystem and Python are not the ones the rest of the machine uses, so
+    Git Bash is preferred and WSL stubs are skipped when scanning PATH."""
+    if platform.system() != "Windows":
+        return "bash"
+
+    preferred = (
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    )
+    for exe in preferred:
+        if os.path.isfile(exe):
+            return exe
+
+    skip_markers = ("windowsapps", "system32", "syswow64", "sysnative")
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        exe = os.path.join(entry, "bash.exe")
+        if os.path.isfile(exe) and not any(marker in exe.lower() for marker in skip_markers):
+            return exe
+
+    return "bash"
+
+
+def _find_powershell() -> str:
+    """Absolute paths first, PATH only as a fallback. A PATH that has lost
+    System32 — a user variable that overflowed and got truncated, a launcher
+    started with a trimmed environment — is precisely the case where a bare
+    "powershell" fails to resolve, and Windows PowerShell is always present at
+    the fixed location below."""
+    if platform.system() != "Windows":
+        return shutil.which("pwsh") or "pwsh"
+
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    preferred = (
+        rf"{program_files}\PowerShell\7\pwsh.exe",
+        rf"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe",
+    )
+    for exe in preferred:
+        if os.path.isfile(exe):
+            return exe
+
+    return shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _strip_ansi(text: str) -> str:
+    """Colour codes survive redirection in pwsh 7 and in plenty of CLI tools, so
+    captured output arrives full of escape sequences. They mean nothing to the
+    agent reading it and only burn context."""
+    return _ANSI.sub("", text)
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    cut = len(text) - head - tail
+    return f"{text[:head]}\n...[обрезано {cut} символов]...\n{text[-tail:]}"
+
+
+def _tool_error(text: str) -> dict[str, Any]:
+    return {"result": text, "stdout": "", "stderr": text, "returncode": 1}
+
+
+def parse_client_command(command: Any) -> tuple[str, dict[str, Any]]:
+    """The agent addresses a client-side tool by name, passing the model's raw
+    JSON arguments: {"name": "run_bash", "arguments": '{"command": "ls"}'}."""
+    if isinstance(command, str):  # older agent builds sent a bare shell string
+        return "run_bash", {"command": command}
+    if not isinstance(command, dict):
+        return "", {}
+
+    arguments = command.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return str(command.get("name") or ""), arguments
+
+
+def command_text(name: str, arguments: dict[str, Any]) -> str:
+    """What the user sees in the command block and the permission dialog."""
+    if name in ("run_bash", "run_powershell", "run_in_terminal"):
+        return str(arguments.get("command") or "")
+    if name == "ask_user":
+        return str(arguments.get("question") or "")
+    return f"{name}({json.dumps(arguments, ensure_ascii=False)})"
+
+
 class RabbitMQClient(RabbitMQBase):
-    def __init__(self, event_handler):
+    def __init__(self, event_handler, host: str, port: int = DEFAULT_RABBITMQ_PORT):
         super().__init__(
             USER,
             PASSWORD,
             EXCHANGE,
             CLIENT_QUEUE,
             ROUTING_KEY,
-            host=RABBITMQ_HOST,
-            port=RABBITMQ_PORT,
+            host=host,
+            port=port,
         )
+        self._router_host = host
+        self._router_port = port
         self._rpc_user = USER
         self._rpc_password = PASSWORD
-        self._rpc_host = RABBITMQ_HOST
-        self._rpc_port = RABBITMQ_PORT
+        self._rpc_host = host
+        self._rpc_port = port
         self.agent_session = {}
         self.work_dir = DEFAULT_WORKDIR
         self.allow_commands_for_request = False
@@ -113,6 +228,15 @@ class RabbitMQClient(RabbitMQBase):
         )
         return response["chat"]
 
+    def list_models(self, provider: str, url: str = "") -> list[str]:
+        """Ask the backend which models it can reach. Model addresses are the
+        server's to resolve — this client may not even be on the same network."""
+        response = self._supervisor_request(
+            {"type": "client_data", "action": "list_models", "provider": provider, "url": url},
+            timeout=20.0,
+        )
+        return list(response["models"])
+
     def get_chat_history(self, chat_id: int) -> list[dict]:
         response = self._supervisor_request(
             {"type": "client_data", "action": "get_history", "chat_id": chat_id}
@@ -181,39 +305,31 @@ class RabbitMQClient(RabbitMQBase):
                 work_dir = self.work_dir
                 work_dir.mkdir(parents=True, exist_ok=True)
                 command_id = properties.correlation_id or str(method.delivery_tag)
-                command = message.get("command", "")
+                name, arguments = parse_client_command(message.get("command"))
                 command_info = {
                     "id": command_id,
-                    "command": command,
+                    "name": name,
+                    "command": command_text(name, arguments),
                     "cwd": str(work_dir),
                 }
                 self._emit(
                     "on_client_command_start",
                     command_info,
                 )
-                if self._can_run_command(command_info):
-                    result = subprocess.run(
-                        command,
-                        cwd=work_dir,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    response = {
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                        "returncode": result.returncode,
-                        "command": command,
-                        "cwd": str(work_dir),
-                    }
+                if name == "ask_user":
+                    # Asking a question runs nothing on the machine, so it is
+                    # not subject to the command-execution access level.
+                    response = self._ask_user(command_info["command"])
+                elif self._can_run_command(command_info):
+                    response = self._execute_client_tool(name, arguments, work_dir)
                 else:
-                    response = {
-                        "stdout": "",
-                        "stderr": "read only",
-                        "returncode": 1,
-                        "command": command,
-                        "cwd": str(work_dir),
-                    }
+                    response = _tool_error("read only")
+
+                response = {
+                    **response,
+                    "command": command_info["command"],
+                    "cwd": str(work_dir),
+                }
                 self._emit(
                     "on_client_command_result",
                     {
@@ -239,6 +355,118 @@ class RabbitMQClient(RabbitMQBase):
             logger.exception("Error processing client message: %s", e)
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
+    def _execute_client_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        work_dir: pathlib.Path,
+    ) -> dict[str, Any]:
+        """Run one of the tools the agent marked default_target="client".
+        The agent reads the "result" key; the UI reads stdout/stderr/returncode."""
+        command = str(arguments.get("command") or "")
+        timeout = int(arguments.get("timeout") or DEFAULT_COMMAND_TIMEOUT)
+        limit = min(int(arguments.get("limit") or DEFAULT_OUTPUT_LIMIT), MAX_OUTPUT_CHARS)
+
+        if name == "run_in_terminal":
+            return self._launch_in_terminal(command, work_dir)
+        if name == "run_bash":
+            argv = [_find_bash(), "-lc", command]
+        elif name == "run_powershell":
+            argv = [_find_powershell(), "-NoProfile", "-NonInteractive", "-Command", command]
+        else:
+            return _tool_error(f"[unknown client tool: {name}]")
+
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                # Both shells we launch speak UTF-8. Without saying so, Python
+                # decodes with the system code page — on a Russian Windows that
+                # turned "июл 28" into "РёСЋР» 28" in everything the agent read.
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                creationflags=NO_WINDOW,
+                # Nobody is at a keyboard here. Without this the child inherits
+                # whatever handle the client happens to have: an invalid one in
+                # the GUI build (instant EOF), a real terminal in a console run
+                # — where a script waiting for input would hang the whole
+                # command until it timed out.
+                stdin=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return _tool_error(f"[{name} unavailable: {argv[0]} not found]")
+        except subprocess.TimeoutExpired:
+            return _tool_error(f"[{name}: timed out after {timeout} s]")
+
+        output = _strip_ansi(result.stdout + result.stderr).strip()
+        output = output or f"(код возврата {result.returncode})"
+        if result.returncode != 0:
+            output = f"[exit {result.returncode}] {output}"
+        return {
+            "result": _truncate_middle(output, limit),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+
+    def _launch_in_terminal(self, command: str, work_dir: pathlib.Path) -> dict[str, Any]:
+        """Open a real console window and hand it to the user.
+
+        Nothing is captured and nothing is waited for: the program is theirs to
+        interact with from here on. This is the only way an interactive script
+        can run at all — every other command executes with no terminal, where
+        the first prompt for input hits EOF.
+        """
+        if not command:
+            return _tool_error("[run_in_terminal: пустая команда]")
+
+        try:
+            if platform.system() == "Windows":
+                # Passed as one raw command line on purpose: given a list, Python
+                # escapes inner quotes the C way (\") and cmd does not read them
+                # back, so `python "app with space.py"` and `python -c "..."`
+                # both break. `pause` keeps the window up after the program
+                # exits, so its last output stays readable.
+                subprocess.Popen(
+                    f'cmd /c "{command} & echo. & pause"',
+                    cwd=work_dir,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    close_fds=True,
+                )
+            else:
+                terminal = next(
+                    (
+                        found
+                        for found in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm")
+                        if shutil.which(found)
+                    ),
+                    None,
+                )
+                if terminal is None:
+                    return _tool_error("[run_in_terminal: не найден эмулятор терминала]")
+                subprocess.Popen(
+                    [terminal, "-e", f"sh -c '{command}; read -p \"\"'"],
+                    cwd=work_dir,
+                    close_fds=True,
+                )
+        except Exception as error:
+            return _tool_error(f"[run_in_terminal: не удалось запустить: {error}]")
+
+        message = f"Запущено в отдельном окне терминала: {command}"
+        return {"result": message, "stdout": message, "stderr": "", "returncode": 0}
+
+    def _ask_user(self, question: str) -> dict[str, Any]:
+        handler = getattr(self.event_handler, "request_user_answer", None)
+        if handler is None:
+            return _tool_error("[ask_user unavailable: this client cannot show questions]")
+        answer = str(handler(question) or "").strip()
+        if not answer:
+            return _tool_error("[the user did not answer the question]")
+        return {"result": answer, "stdout": answer, "stderr": "", "returncode": 0}
+
     def _publish(self, message: dict) -> None:
         self.allow_commands_for_request = False
         self.publish_message(message)
@@ -247,9 +475,14 @@ class RabbitMQClient(RabbitMQBase):
     def _reconnect_to_personal(self, credentials: dict):
         self.connection.close()
 
+        # The personal queue normally lives on the same machine the client just
+        # logged in to, so reuse that address; the server only names a host when
+        # its queues really sit elsewhere.
+        host = str(credentials.get("rabbitmq_host") or self._router_host)
+        port = int(credentials["rabbitmq_port"])
         personal_url = (
             f"amqp://{credentials['rabbitmq_user']}:{credentials['rabbitmq_password']}"
-            f"@{credentials['rabbitmq_host']}:{credentials['rabbitmq_port']}/"
+            f"@{host}:{port}/"
         )
 
         self.connection = pika.BlockingConnection(pika.URLParameters(personal_url))
@@ -260,23 +493,21 @@ class RabbitMQClient(RabbitMQBase):
         self.routing_key = AGENT_ROUTING_KEY
         self._rpc_user = credentials["rabbitmq_user"]
         self._rpc_password = credentials["rabbitmq_password"]
-        self._rpc_host = credentials["rabbitmq_host"]
-        self._rpc_port = int(credentials["rabbitmq_port"])
+        self._rpc_host = host
+        self._rpc_port = port
 
-        self.channel.basic_qos(prefetch_count=1)
-        self.channel.basic_consume(queue=self.queue, on_message_callback=self.receive_message)
-        logger.info(
-            "Connected to personal RabbitMQ at %s:%s",
-            credentials["rabbitmq_host"],
-            credentials["rabbitmq_port"],
-        )
+        # Consuming is started by start_consuming() in the consumer thread.
+        # Subscribing here too left two consumers on one queue, so deliveries
+        # were split between them round-robin for no reason. Nothing is lost in
+        # the gap: client_queue is durable and holds messages until then.
+        logger.info("Connected to personal RabbitMQ at %s:%s", host, port)
 
     def send_logout(self):
         if not self.login:
             return
         temp_connection = None
         try:
-            router_url = f"amqp://{USER}:{PASSWORD}@{RABBITMQ_HOST}:{RABBITMQ_PORT}/"
+            router_url = f"amqp://{USER}:{PASSWORD}@{self._router_host}:{self._router_port}/"
             temp_connection = pika.BlockingConnection(pika.URLParameters(router_url))
             temp_channel = temp_connection.channel()
 

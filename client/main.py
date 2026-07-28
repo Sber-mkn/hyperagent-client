@@ -3,8 +3,9 @@ import pathlib
 import sys
 import threading
 
+from client.core.client_state import split_server_address
 from client.core.rabbitmq_client import RabbitMQClient
-from client.ui.console import ConsoleClientUI, read_login_payload
+from client.ui.console import ConsoleClientUI, read_login_payload, read_server_address
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     ui = ConsoleClientUI()
+    host, port = split_server_address(read_server_address())
     login, password, agent_type, agent_config = read_login_payload()
-    client = RabbitMQClient(event_handler=ui)
+    client = RabbitMQClient(event_handler=ui, host=host, port=port)
     client.agent_session = {"agent_type": agent_type, "agent_config": agent_config}
     logger.info("Starting client")
     client.send_login(login, password)

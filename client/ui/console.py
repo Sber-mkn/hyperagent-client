@@ -1,3 +1,4 @@
+import os
 from getpass import getpass
 from typing import Any
 
@@ -37,6 +38,14 @@ def _choose_local_model() -> str:
             if value.lower() == model.lower():
                 return model
         print("Enter 1, 2, 3, or one of the shown model names.")
+
+
+def read_server_address() -> str:
+    """Which backend to talk to. Blank means localhost, same as in the GUI."""
+    return (
+        os.getenv("HYPERAGENT_SERVER")
+        or input("Server address (host[:port], blank = localhost): ").strip()
+    )
 
 
 def read_login_payload() -> tuple[str, str, str, dict]:
@@ -86,6 +95,16 @@ class ConsoleClientUI:
     @staticmethod
     def on_unknown_message(message_type: str) -> None:
         print(f"\nUnknown message type: {message_type}")
+
+    @staticmethod
+    def request_user_answer(question: str) -> str:
+        # Safe to read stdin here: input_loop is parked on ready_event for as
+        # long as the agent is working on the task that asked this question.
+        print(f"\n\n[Вопрос агента] {question}")
+        try:
+            return input("> ").strip()
+        except EOFError:
+            return ""
 
     def input_loop(self, client) -> None:
         while True:

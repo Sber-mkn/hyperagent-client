@@ -1,6 +1,7 @@
 import contextlib
-import threading
 import re
+import threading
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, override
 
@@ -33,19 +34,13 @@ from client.core.client_state import (
     ACCESS_ASK,
     ACCESS_FULL,
     ACCESS_READ_ONLY,
-    HYPER_OLLAMA_URL,
     MODEL_LOCAL,
     MODEL_OLLAMA,
     MODEL_OPENAI,
     MODEL_OPENROUTER,
 )
-from client.core.model_catalog import (
-    fetch_ollama_models,
-    fetch_openai_models,
-    fetch_openrouter_models,
-)
+from client.core.model_catalog import fetch_openai_models, fetch_openrouter_models
 from client.ui.qt_blocks import CommandGroupBlock, PaperPlaneButton, StreamTextBlock
-
 
 _TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
 
@@ -96,11 +91,14 @@ class ClearableListWidget(QListWidget):
 
 
 class LoginPage(QWidget):
-    login_requested = pyqtSignal(str, str)
+    # The server is picked here, before credentials: an account only exists on
+    # one particular backend, so there is nothing to log into until it is known.
+    login_requested = pyqtSignal(str, str, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.server_input = QLineEdit()
         self.login_input = QLineEdit()
         self.password_input = QLineEdit()
         self.login_button = QPushButton("Login")
@@ -133,8 +131,16 @@ class LoginPage(QWidget):
         self.login_input.clear()
         self.password_input.clear()
 
+    def set_server(self, address: str) -> None:
+        self.server_input.setText(address)
+
+    def focus_server(self) -> None:
+        self.server_input.setFocus()
+        self.server_input.selectAll()
+
     def set_busy(self, busy: bool) -> None:
         self.login_button.setDisabled(busy)
+        self.server_input.setDisabled(busy)
         self.login_input.setDisabled(busy)
         self.password_input.setDisabled(busy)
         self.login_button.setText("Connecting..." if busy else "Login")
@@ -143,6 +149,13 @@ class LoginPage(QWidget):
         self.error_label.setText(message)
         self.error_label.show()
         self.set_busy(False)
+
+    def show_status(self, message: str) -> None:
+        """Progress while connecting: shown without ending the busy state,
+        so the user learns what is being waited on instead of only seeing
+        the button say "Connecting..." indefinitely."""
+        self.error_label.setText(message)
+        self.error_label.show()
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -165,11 +178,16 @@ class LoginPage(QWidget):
         subtitle.setObjectName("loginSubtitle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        server_label = QLabel("Server")
+        server_label.setObjectName("inputLabel")
         login_label = QLabel("Login")
         login_label.setObjectName("inputLabel")
         password_label = QLabel("Password")
         password_label.setObjectName("inputLabel")
 
+        self.server_input.setPlaceholderText("localhost (по умолчанию)")
+        self.server_input.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.server_input.returnPressed.connect(self._submit)
         self.login_input.setPlaceholderText("Login")
         self.login_input.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.password_input.setPlaceholderText("Password")
@@ -188,6 +206,8 @@ class LoginPage(QWidget):
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addSpacing(8)
+        layout.addWidget(server_label)
+        layout.addWidget(self.server_input)
         layout.addWidget(login_label)
         layout.addWidget(self.login_input)
         layout.addWidget(password_label)
@@ -197,10 +217,13 @@ class LoginPage(QWidget):
         layout.addWidget(self.login_button)
         root.addWidget(panel)
 
-        for widget in (panel, title, subtitle, login_label, password_label):
+        for widget in (panel, title, subtitle, server_label, login_label, password_label):
             widget.installEventFilter(self)
 
     def _submit(self) -> None:
+        # An empty address is not an error: it means the backend is on this same
+        # machine, and the window resolves it to localhost.
+        server = self.server_input.text().strip()
         login = self.login_input.text().strip()
         password = self.password_input.text()
         if not login or not password:
@@ -208,7 +231,7 @@ class LoginPage(QWidget):
             return
         self.error_label.hide()
         self.set_busy(True)
-        self.login_requested.emit(login, password)
+        self.login_requested.emit(server, login, password)
 
 
 class ChatListPage(QWidget):
@@ -295,6 +318,7 @@ class ChatListPage(QWidget):
 class SettingsPage(QWidget):
     back_requested = pyqtSignal()
     save_requested = pyqtSignal(dict)
+    change_server_requested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -304,6 +328,8 @@ class SettingsPage(QWidget):
         self.openrouter_radio = QRadioButton("OpenRouter")
         self.ollama_radio = QRadioButton("Ollama")
         self.openai_radio = QRadioButton("OpenAI")
+        self.server_label = QLabel("")
+        self.change_server_button = QPushButton("Change server")
         self.openrouter_api_input = QLineEdit()
         self.ollama_url_input = QLineEdit()
         self.openai_api_input = QLineEdit()
@@ -313,6 +339,7 @@ class SettingsPage(QWidget):
         self.light_radio = QRadioButton("Light")
         self.back_button = QPushButton("Back")
         self.save_button = QPushButton("Save")
+        self.server_frame = QFrame()
         self.openrouter_frame = QFrame()
         self.ollama_frame = QFrame()
         self.openai_frame = QFrame()
@@ -325,6 +352,8 @@ class SettingsPage(QWidget):
         self.openrouter_radio.setChecked(model == MODEL_OPENROUTER)
         self.ollama_radio.setChecked(model == MODEL_OLLAMA)
         self.openai_radio.setChecked(model == MODEL_OPENAI)
+        server_host = str(settings.get("server_host") or "")
+        self.server_label.setText(f"Connected to {server_host}" if server_host else "No server")
         self.openrouter_api_input.setText(str(settings.get("openrouter_api_key") or ""))
         self.ollama_url_input.setText(str(settings.get("ollama_url") or ""))
         self.openai_api_input.setText(str(settings.get("openai_api_key") or ""))
@@ -357,6 +386,10 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(body)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
+
+        layout.addWidget(_settings_section_title("Server"))
+        self._build_server_frame()
+        layout.addWidget(self.server_frame)
 
         layout.addWidget(_settings_section_title("Agent type"))
         self.model_group.addButton(self.local_radio)
@@ -399,6 +432,22 @@ class SettingsPage(QWidget):
 
         root.addWidget(header)
         root.addWidget(body, 1)
+
+    def _build_server_frame(self) -> None:
+        self.server_frame.setObjectName("settingsPanel")
+        layout = QVBoxLayout(self.server_frame)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+        # Switching backends means signing in again -- the account, its chats
+        # and its models all belong to one particular server -- so this is a
+        # button back to the login screen, not an editable field.
+        self.server_label.setObjectName("inputLabel")
+        self.server_label.setWordWrap(True)
+        self.change_server_button.setObjectName("ghostButton")
+        self.change_server_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.change_server_button.clicked.connect(self.change_server_requested.emit)
+        layout.addWidget(self.server_label)
+        layout.addWidget(self.change_server_button)
 
     def _build_openrouter_frame(self) -> None:
         self.openrouter_frame.setObjectName("settingsPanel")
@@ -471,6 +520,8 @@ class SettingsPage(QWidget):
             model = MODEL_OLLAMA
         elif self.openai_radio.isChecked():
             model = MODEL_OPENAI
+        # server_host is deliberately absent: it is set on the login screen and
+        # merged into the stored settings there, not edited here.
         return {
             "model": model,
             "openrouter_api_key": self.openrouter_api_input.text().strip(),
@@ -519,6 +570,7 @@ class ChatPage(QWidget):
         self._current_response_model: str | None = None
         self._command_groups: dict[str, CommandGroupBlock] = {}
         self._current_provider = MODEL_LOCAL
+        self._model_lister: Callable[[str], list[str]] | None = None
         self._provider_context: dict[str, str] = {
             "ollama_url": "",
             "openrouter_api_key": "",
@@ -586,6 +638,12 @@ class ChatPage(QWidget):
         self.new_chat_button.setCursor(
             Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor
         )
+
+    def set_model_lister(self, lister: Callable[[str], list[str]] | None) -> None:
+        """Available once a backend is connected — server-resolved providers
+        could not be listed before that, so let them fetch again now."""
+        self._model_lister = lister
+        self._fetched_providers.difference_update({MODEL_LOCAL, MODEL_OLLAMA})
 
     def set_model(self, model: str, settings: dict[str, Any] | None = None) -> None:
         context_changed = False
@@ -707,15 +765,16 @@ class ChatPage(QWidget):
             self.model_choice_selected.emit(provider, name)
 
     def _refresh_available_models(self, provider: str) -> None:
-        if provider == MODEL_OLLAMA:
-            # An unconfigured URL falls back to the standard local Ollama
-            # default (the same address Hyper's fixed backend happens to
-            # use) rather than showing "No models" for a server that's
-            # actually reachable at the well-known default port.
-            url = self._provider_context.get("ollama_url") or HYPER_OLLAMA_URL
+        if provider in (MODEL_LOCAL, MODEL_OLLAMA):
+            # Both are models the *server* calls, so only the server can say
+            # what lives at that address — this client may sit on a different
+            # machine entirely. Before login there is nobody to ask yet.
+            lister = self._model_lister
+            if lister is None:
+                return
 
             def fetch_fn() -> list[str]:
-                return fetch_ollama_models(url)
+                return lister(provider)
         elif provider == MODEL_OPENROUTER:
             api_key = self._provider_context.get("openrouter_api_key") or ""
 
@@ -733,9 +792,7 @@ class ChatPage(QWidget):
             def fetch_fn() -> list[str]:
                 return fetch_openai_models(api_key)
         else:
-            url = f"http://100.93.59.55:11434"
-            def fetch_fn() -> list[str]:
-                return fetch_ollama_models(url)
+            return
 
         def worker() -> None:
             try:

@@ -1,28 +1,18 @@
-"""Fetch the list of models a provider currently has available, for the settings UI."""
+"""Fetch the list of models a provider currently has available, for the settings UI.
+
+Only the hosted APIs are listed from here: they answer the same way from any
+machine, and their key lives on this side. Ollama addresses are the server's to
+resolve, so those lists come from the backend (see RabbitMQClient.list_models).
+"""
 
 from __future__ import annotations
 
 import requests
 
-OLLAMA_TAGS_TIMEOUT = 5
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_TIMEOUT = 10
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 OPENAI_TIMEOUT = 10
-
-
-def fetch_ollama_models(base_url: str) -> list[str]:
-    """List models already pulled on the given Ollama server (its ``ollama list``)."""
-    url = base_url.rstrip("/") + "/api/tags"
-    response = requests.get(url, timeout=OLLAMA_TAGS_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-    names = {
-        str(model["name"])
-        for model in data.get("models", [])
-        if isinstance(model, dict) and model.get("name")
-    }
-    return sorted(names)
 
 
 def _fetch_model_ids(url: str, headers: dict[str, str], timeout: int) -> list[str]:

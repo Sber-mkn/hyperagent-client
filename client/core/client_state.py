@@ -10,11 +10,17 @@ MODEL_LOCAL = "local"
 MODEL_OPENROUTER = "openrouter"
 MODEL_OLLAMA = "ollama"
 MODEL_OPENAI = "openai"
-HYPER_OLLAMA_URL = "http://localhost:11434"
 ACCESS_READ_ONLY = "read_only"
 ACCESS_ASK = "ask"
 ACCESS_FULL = "full_access"
+DEFAULT_RABBITMQ_PORT = 5672
+# Leaving the address blank means the backend runs on this same machine, which
+# is the usual case while developing.
+DEFAULT_SERVER_HOST = "localhost"
 DEFAULT_SETTINGS = {
+    # Which deployment this client talks to. There is no default: a wrong
+    # guess fails at connect time with no hint of what to correct.
+    "server_host": "",
     "model": MODEL_LOCAL,
     "local_model": "",
     "openrouter_api_key": "",
@@ -27,6 +33,18 @@ DEFAULT_SETTINGS = {
     "access": ACCESS_ASK,
     "work_dir": "",
 }
+
+
+def split_server_address(address: str) -> tuple[str, int]:
+    """Split the configured backend address into host and RabbitMQ port,
+    accepting "host", "host:port" and a pasted "amqp://host:port". An empty
+    address falls back to localhost."""
+    value = (address or "").strip().removeprefix("amqp://").rstrip("/")
+    host, _, port = value.partition(":")
+    host = host.strip() or DEFAULT_SERVER_HOST
+    if port.strip().isdigit():
+        return host, int(port)
+    return host, DEFAULT_RABBITMQ_PORT
 
 
 class ClientState:

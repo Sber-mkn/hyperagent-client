@@ -9,8 +9,10 @@ from PyQt6.QtWidgets import QInputDialog, QMainWindow, QMessageBox, QStackedWidg
 from client.core.chat_controller import ChatController
 from client.core.client_state import (
     ACCESS_ASK,
+    DEFAULT_SERVER_HOST,
     MODEL_LOCAL,
     ClientState,
+    split_server_address,
 )
 from client.core.rabbitmq_client import RabbitMQClient
 from client.ui.qt_pages import ChatListPage, ChatPage, LoginPage, SettingsPage
@@ -21,6 +23,19 @@ class CommandPermissionRequest:
     def __init__(self, command: dict[str, Any]) -> None:
         self.command = command
         self.decision = "deny"
+        self.done = threading.Event()
+
+
+# How long to wait for the backend to confirm the agent is ready before giving
+# up. Connecting itself is already done by this point, so this only covers the
+# backend answering — minutes of image building happen earlier, during login.
+READY_TIMEOUT_MS = 90_000
+
+
+class AskUserRequest:
+    def __init__(self, question: str) -> None:
+        self.question = question
+        self.answer = ""
         self.done = threading.Event()
 
 
@@ -36,6 +51,7 @@ class ClientEventBridge(QObject):
     client_command_start = pyqtSignal(object)
     client_command_result = pyqtSignal(object)
     command_permission_requested = pyqtSignal(object)
+    user_answer_requested = pyqtSignal(object)
 
     def on_ready(self) -> None:
         self.ready.emit()
@@ -70,6 +86,12 @@ class ClientEventBridge(QObject):
         request.done.wait()
         return request.decision
 
+    def request_user_answer(self, question: str) -> str:
+        request = AskUserRequest(question)
+        self.user_answer_requested.emit(request)
+        request.done.wait()
+        return request.answer
+
 
 class HyperagentClientWindow(QMainWindow):
     def __init__(
@@ -90,6 +112,7 @@ class HyperagentClientWindow(QMainWindow):
         self.login_thread: threading.Thread | None = None
         self.settings_return_widget = None
         self.logged_in = False
+        self.ready_timer: QTimer | None = None
 
         self.stack = QStackedWidget()
         self.login_page = LoginPage()
@@ -134,15 +157,31 @@ class HyperagentClientWindow(QMainWindow):
         self.chat_page.send_requested.connect(self._send_task)
         self.settings_page.back_requested.connect(self._return_from_settings)
         self.settings_page.save_requested.connect(self._save_settings)
+        self.settings_page.change_server_requested.connect(self._change_server)
 
     def _load_saved_session(self) -> None:
-        session = self.controller.saved_session()
-        if not session:
+        """Reconnect silently when the last session left everything we need.
+        Otherwise still fill in whatever was stored, so a first run only asks
+        for what is actually missing."""
+        session = self.controller.saved_session() or {}
+        server_address = self.controller.server_address()
+        self.login_page.set_server(server_address)
+        self.login_page.set_credentials(
+            str(session.get("login") or ""),
+            str(session.get("password") or ""),
+        )
+        if not self.controller.can_resume_session():
+            self.login_page.focus_server()
             return
-        self.login_page.set_credentials(session["login"], session["password"])
-        QTimer.singleShot(0, lambda: self._login(session["login"], session["password"]))
+        QTimer.singleShot(
+            0,
+            lambda: self._login(server_address, session["login"], session["password"]),
+        )
 
-    def _login(self, login: str, password: str) -> None:
+    def _login(self, server_address: str, login: str, password: str) -> None:
+        # No address means the backend is here, on this machine.
+        server_address = server_address.strip() or DEFAULT_SERVER_HOST
+        self.controller.set_server_address(server_address)
         self._close_client()
         self.login_page.set_busy(True)
         self.controller.begin_login(login, password)
@@ -159,11 +198,12 @@ class HyperagentClientWindow(QMainWindow):
         self.bridge.client_command_start.connect(self._on_client_command_start)
         self.bridge.client_command_result.connect(self._on_client_command_result)
         self.bridge.command_permission_requested.connect(self._on_command_permission_requested)
+        self.bridge.user_answer_requested.connect(self._on_user_answer_requested)
 
         agent_session = self.controller.agent_session()
         self.login_thread = threading.Thread(
             target=self._connect_login,
-            args=(login, password, agent_session, self.bridge),
+            args=(login, password, agent_session, self.bridge, server_address),
             daemon=True,
         )
         self.login_thread.start()
@@ -174,10 +214,12 @@ class HyperagentClientWindow(QMainWindow):
         password: str,
         agent_session: dict[str, Any],
         bridge: ClientEventBridge,
+        server_address: str,
     ) -> None:
         client = None
+        host, port = split_server_address(server_address)
         try:
-            client = RabbitMQClient(event_handler=bridge)
+            client = RabbitMQClient(event_handler=bridge, host=host, port=port)
             client.agent_session = agent_session
             if client.send_login(login, password):
                 bridge.login_connected.emit(client)
@@ -189,9 +231,36 @@ class HyperagentClientWindow(QMainWindow):
             with contextlib.suppress(Exception):
                 client.connection.close()
 
+    def _start_ready_timer(self) -> None:
+        self._stop_ready_timer()
+        self.ready_timer = QTimer(self)
+        self.ready_timer.setSingleShot(True)
+        self.ready_timer.timeout.connect(self._on_ready_timeout)
+        self.ready_timer.start(READY_TIMEOUT_MS)
+
+    def _stop_ready_timer(self) -> None:
+        if self.ready_timer is not None:
+            self.ready_timer.stop()
+            self.ready_timer = None
+
+    def _on_ready_timeout(self) -> None:
+        if self.logged_in:
+            return
+        self._close_client()
+        self.login_page.show_error(
+            "Сервер принял подключение, но агент не подтвердил готовность. "
+            "Проверьте контейнер агента на сервере и попробуйте войти снова."
+        )
+
     def _on_login_connected(self, client: RabbitMQClient) -> None:
         self.client = client
         self.controller.attach_client(client)
+        # Connected, but the session only really starts once the backend
+        # answers with ready -- and that answer may never come.
+        self._start_ready_timer()
+        # Only now is there a backend to ask which models it can reach.
+        self.chat_page.set_model_lister(self.controller.list_models)
+        self._apply_settings_to_ui()
         self.consumer_stop_event = threading.Event()
         consumer_thread = threading.Thread(
             target=self._consume,
@@ -226,8 +295,11 @@ class HyperagentClientWindow(QMainWindow):
         try:
             self.controller.load_chats()
         except Exception:
+            # A failed load says nothing about whether a new chat can be
+            # started — that is a local action — so the button stays usable
+            # instead of latching off until some later successful load.
             self.chat_list_page.set_chats([], None)
-            self.chat_list_page.set_new_chat_enabled(False)
+            self.chat_list_page.set_new_chat_enabled(self.controller.can_create_chat())
             self.chat_page.append_status("Не удалось загрузить чаты.")  # noqa: RUF001
             return
         self._refresh_chats()
@@ -238,7 +310,8 @@ class HyperagentClientWindow(QMainWindow):
         self.stack.setCurrentWidget(self.settings_page)
 
     def _return_from_settings(self) -> None:
-        self.stack.setCurrentWidget(self.settings_return_widget or self.chat_list_page)
+        fallback = self.login_page if not self.logged_in else self.chat_list_page
+        self.stack.setCurrentWidget(self.settings_return_widget or fallback)
 
     def _save_settings(self, settings: dict[str, Any]) -> None:
         current = self.controller.settings()
@@ -247,6 +320,17 @@ class HyperagentClientWindow(QMainWindow):
         self.setStyleSheet(stylesheet(self.controller.theme()))
         self._apply_settings_to_ui()
         self._return_from_settings()
+
+    def _change_server(self) -> None:
+        """Back to the login screen for a different backend. The address and
+        login are kept as a starting point; the password is not, since the
+        account on another server is a different one."""
+        server_address = self.controller.server_address()
+        login = str((self.controller.saved_session() or {}).get("login") or "")
+        self._logout()
+        self.login_page.set_server(server_address)
+        self.login_page.set_credentials(login, "")
+        self.login_page.focus_server()
 
     def _select_provider(self, model: str) -> None:
         if not self.controller.provider_configured(model):
@@ -265,6 +349,7 @@ class HyperagentClientWindow(QMainWindow):
 
     def _apply_settings_to_ui(self) -> None:
         settings = self.controller.settings()
+        self.login_page.set_server(str(settings.get("server_host") or ""))
         self.chat_page.set_model(str(settings.get("model") or MODEL_LOCAL), settings)
         self.chat_page.set_access(str(settings.get("access") or ACCESS_ASK))
         self.settings_page.set_settings(settings)
@@ -347,6 +432,7 @@ class HyperagentClientWindow(QMainWindow):
 
     def _on_ready(self) -> None:
         if not self.logged_in:
+            self._stop_ready_timer()
             self.logged_in = True
             self.login_page.set_busy(False)
             self.controller.complete_login()
@@ -370,6 +456,13 @@ class HyperagentClientWindow(QMainWindow):
             self.chat_page.append_result(message)
 
     def _on_agent_message(self, kind: str, message: Any) -> None:
+        if not self.logged_in:
+            # Still on the login screen, where no chat is open to append to --
+            # without this the backend's explanation of what it is waiting for
+            # was dropped and the user just watched "Connecting..." forever.
+            self.login_page.show_status("" if message is None else str(message))
+            return
+
         chat_id = self.controller.event_chat_id(None)
         if kind == "error":
             self.controller.record_error(chat_id, "" if message is None else str(message))
@@ -432,6 +525,15 @@ class HyperagentClientWindow(QMainWindow):
             request.decision = "deny"
         request.done.set()
 
+    def _on_user_answer_requested(self, request: AskUserRequest) -> None:
+        answer, accepted = QInputDialog.getText(
+            self,
+            "Вопрос агента",
+            request.question or "Агент запросил уточнение.",
+        )
+        request.answer = answer.strip() if accepted else ""
+        request.done.set()
+
     def _on_login_error(self, message: str) -> None:
         if not self.logged_in:
             self.login_page.show_error(message or "Неправильный пароль.")
@@ -459,6 +561,8 @@ class HyperagentClientWindow(QMainWindow):
             stop_event.set()
         self.client = None
         self.controller.detach_client()
+        self.chat_page.set_model_lister(None)
+        self._stop_ready_timer()
         self.consumer_stop_event = None
         with contextlib.suppress(Exception):
             client.channel.stop_consuming()

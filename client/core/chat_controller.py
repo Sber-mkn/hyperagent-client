@@ -7,7 +7,6 @@ from client.core.client_state import (
     ACCESS_READ_ONLY,
     DEFAULT_AGENT_CONFIG,
     DEFAULT_AGENT_TYPE,
-    HYPER_OLLAMA_URL,
     MODEL_LOCAL,
     MODEL_OLLAMA,
     MODEL_OPENAI,
@@ -43,6 +42,12 @@ class ChatController:
 
     def saved_session(self) -> dict[str, Any] | None:
         return self.state.session()
+
+    def can_resume_session(self) -> bool:
+        """A previous session can be reconnected once both credentials were
+        stored. The address may be blank — that resolves to localhost."""
+        session = self.saved_session()
+        return bool(session and session.get("login") and session.get("password"))
 
     def begin_login(self, login: str, password: str) -> None:
         self.pending_session = {
@@ -234,10 +239,28 @@ class ChatController:
             return bool(settings["openai_api_key"] and settings["openai_model"])
         return True
 
-    def model_fetch_url(self, model: str) -> str:
+    def server_address(self) -> str:
+        return str(self.settings().get("server_host") or "").strip()
+
+    def set_server_address(self, address: str) -> None:
+        """Remember which backend we are talking to. Hyper and custom-Ollama
+        model names are that server's alone — another one very likely has a
+        different set pulled, so a name carried over would be sent to a model
+        that does not exist there. Hosted API model ids are server-independent
+        and stay."""
+        address = address.strip()
+        settings = self.settings()
+        if settings.get("server_host") != address:
+            settings["local_model"] = ""
+            settings["ollama_model"] = ""
+        settings["server_host"] = address
+        self.save_settings(settings)
+
+    def list_models(self, model: str) -> list[str]:
+        """Model lists come from the backend, which is what actually calls them."""
         if model == MODEL_OLLAMA:
-            return str(self.settings().get("ollama_url") or "")
-        return HYPER_OLLAMA_URL
+            return self.client.list_models("ollama", str(self.settings().get("ollama_url") or ""))
+        return self.client.list_models("hyper")
 
     def theme(self) -> str:
         return str(self.settings()["theme"])
