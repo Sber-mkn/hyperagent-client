@@ -40,7 +40,13 @@ from client.core.client_state import (
     MODEL_OPENROUTER,
 )
 from client.core.model_catalog import fetch_openai_models, fetch_openrouter_models
-from client.ui.qt_blocks import CommandGroupBlock, PaperPlaneButton, StreamTextBlock
+from client.ui.qt_blocks import (
+    CollapsibleBlock,
+    CommandGroupBlock,
+    PaperPlaneButton,
+    StreamTextBlock,
+    WrappingText,
+)
 
 _TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
 
@@ -91,8 +97,6 @@ class ClearableListWidget(QListWidget):
 
 
 class LoginPage(QWidget):
-    # The server is picked here, before credentials: an account only exists on
-    # one particular backend, so there is nothing to log into until it is known.
     login_requested = pyqtSignal(str, str, str)
 
     def __init__(self) -> None:
@@ -221,8 +225,6 @@ class LoginPage(QWidget):
             widget.installEventFilter(self)
 
     def _submit(self) -> None:
-        # An empty address is not an error: it means the backend is on this same
-        # machine, and the window resolves it to localhost.
         server = self.server_input.text().strip()
         login = self.login_input.text().strip()
         password = self.password_input.text()
@@ -430,17 +432,22 @@ class SettingsPage(QWidget):
         self.save_button.clicked.connect(lambda: self.save_requested.emit(self.settings()))
         layout.addWidget(self.save_button)
 
+        # Без прокрутки layout при нехватке высоты сжимал поля ввода до нуля.
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(body)
+
         root.addWidget(header)
-        root.addWidget(body, 1)
+        root.addWidget(scroll, 1)
 
     def _build_server_frame(self) -> None:
         self.server_frame.setObjectName("settingsPanel")
         layout = QVBoxLayout(self.server_frame)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(8)
-        # Switching backends means signing in again -- the account, its chats
-        # and its models all belong to one particular server -- so this is a
-        # button back to the login screen, not an editable field.
         self.server_label.setObjectName("inputLabel")
         self.server_label.setWordWrap(True)
         self.change_server_button.setObjectName("ghostButton")
@@ -520,8 +527,6 @@ class SettingsPage(QWidget):
             model = MODEL_OLLAMA
         elif self.openai_radio.isChecked():
             model = MODEL_OPENAI
-        # server_host is deliberately absent: it is set on the login screen and
-        # merged into the stored settings there, not edited here.
         return {
             "model": model,
             "openrouter_api_key": self.openrouter_api_input.text().strip(),
@@ -565,7 +570,8 @@ class ChatPage(QWidget):
         self._stream_kind: str | None = None
         self._active_think_block: StreamTextBlock | None = None
         self._active_command_group: CommandGroupBlock | None = None
-        self._current_content_label: QLabel | None = None
+        self._active_tool_block: CollapsibleBlock | None = None
+        self._current_content_label: WrappingText | None = None
         self._current_content_text = ""
         self._current_response_model: str | None = None
         self._command_groups: dict[str, CommandGroupBlock] = {}
@@ -665,10 +671,6 @@ class ChatPage(QWidget):
         self._current_provider = model
         self.provider_button.setText(_PROVIDER_LABELS.get(model, "Hyper"))
         self._update_model_button()
-        # Refresh the model list on an actual provider switch, the first time
-        # this provider is ever seen, or when its connection details (Ollama
-        # URL / OpenRouter key) changed since the last fetch — a saved
-        # Settings edit invalidates whatever was cached before it.
         if provider_changed or context_changed or model not in self._fetched_providers:
             self._refresh_available_models(model)
 
@@ -766,9 +768,6 @@ class ChatPage(QWidget):
 
     def _refresh_available_models(self, provider: str) -> None:
         if provider in (MODEL_LOCAL, MODEL_OLLAMA):
-            # Both are models the *server* calls, so only the server can say
-            # what lives at that address — this client may sit on a different
-            # machine entirely. Before login there is nobody to ask yet.
             lister = self._model_lister
             if lister is None:
                 return
@@ -783,9 +782,6 @@ class ChatPage(QWidget):
         elif provider == MODEL_OPENAI:
             api_key = self._provider_context.get("openai_api_key") or ""
             if not api_key:
-                # Unlike OpenRouter, OpenAI requires a key just to list
-                # models -- an unconfigured key can only ever show "No
-                # models", not a real (or borrowed) list.
                 self._models_fetched.emit(provider, [])
                 return
 
@@ -808,19 +804,10 @@ class ChatPage(QWidget):
         self._fetched_providers.add(provider)
         self._available_models[provider] = models
         previous_choice = self._model_by_provider.get(provider) or ""
-        # A saved choice that this provider's server no longer offers (or
-        # was auto-picked earlier against the wrong server, e.g. Local
-        # Ollama borrowing Hyper's list before that was fixed) must not keep
-        # displaying as if it were still selected.
         resolved_choice = previous_choice if previous_choice in models else ""
         if not resolved_choice and models:
             resolved_choice = models[0]
         self._model_by_provider[provider] = resolved_choice
-        # Only announce the change if this fetch is still for the provider
-        # actually active right now. A background fetch started before a
-        # provider switch can resolve after the user has already moved on;
-        # letting it emit unconditionally would push settings["model"] back
-        # to the stale provider it was fetched for.
         if resolved_choice != previous_choice and provider == self._current_provider:
             self.model_choice_selected.emit(provider, resolved_choice)
         if provider == self._current_provider:
@@ -907,6 +894,7 @@ class ChatPage(QWidget):
         if kind != "think":
             self._close_active_think()
         self._close_active_command_group()
+        self._close_active_tool_call()
 
         if kind == "think":
             if self._stream_kind != "think" or self._active_think_block is None:
@@ -948,8 +936,24 @@ class ChatPage(QWidget):
             return
 
         self._reset_stream_state()
-        labels = {"tool_call": "Tool", "status": "Status"}
+
+        if kind == "tool_call":
+            self._append_tool_call(value)
+            return
+
+        labels = {"status": "Status"}
         self._append_text_block(f"{labels.get(kind, kind or 'Message')}: {value}", "statusMessage")
+
+    def _append_tool_call(self, text: str) -> None:
+        block = CollapsibleBlock(_tool_call_name(text), expanded=True)
+        block.body_layout.addWidget(self._create_output_label(text, "statusMessage"))
+        self._active_tool_block = block
+        self._add_output_widget(block)
+
+    def _close_active_tool_call(self) -> None:
+        if self._active_tool_block is not None:
+            self._active_tool_block.collapse()
+            self._active_tool_block = None
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -1105,20 +1109,9 @@ class ChatPage(QWidget):
 
         self.append_agent_message(message_type, value)
 
-    def _create_output_label(self, text: str, object_name: str, markdown: bool = False) -> QLabel:
-        if markdown:
-            text = _ensure_blank_line_before_tables(text)
-        label = QLabel(text)
-        label.setObjectName(object_name)
-        label.setTextFormat(Qt.TextFormat.MarkdownText if markdown else Qt.TextFormat.PlainText)
-        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        label.setMinimumWidth(0)
-        label.setMaximumHeight(16777215)
-        if markdown:
-            label.setOpenExternalLinks(True)
+    def _create_output_label(self, text: str, object_name: str, markdown: bool = False) -> QWidget:
+        label = WrappingText(object_name, markdown=markdown)
+        label.setText(_ensure_blank_line_before_tables(text) if markdown else text)
         return label
 
     def _add_output_widget(self, widget: QWidget) -> None:
@@ -1165,6 +1158,7 @@ class ChatPage(QWidget):
         self._stream_kind = None
         self._active_think_block = None
         self._active_command_group = None
+        self._active_tool_block = None
         self._current_content_label = None
         self._current_content_text = ""
         self._current_response_model = None
@@ -1248,6 +1242,12 @@ def _move_menu_above(button: QToolButton, menu: QMenu) -> None:
     pos = button.mapToGlobal(button.rect().topLeft())
     pos.setY(pos.y() - menu.sizeHint().height())
     menu.move(pos)
+
+
+def _tool_call_name(text: str) -> str:
+    """Из "web_search({...}) [server] -> ..." берём только имя инструмента."""
+    name = text.split("(", 1)[0].strip()
+    return name or "Инструмент"
 
 
 def _settings_section_title(text: str) -> QLabel:

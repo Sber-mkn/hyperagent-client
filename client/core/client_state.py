@@ -14,12 +14,8 @@ ACCESS_READ_ONLY = "read_only"
 ACCESS_ASK = "ask"
 ACCESS_FULL = "full_access"
 DEFAULT_RABBITMQ_PORT = 5672
-# Leaving the address blank means the backend runs on this same machine, which
-# is the usual case while developing.
 DEFAULT_SERVER_HOST = "localhost"
 DEFAULT_SETTINGS = {
-    # Which deployment this client talks to. There is no default: a wrong
-    # guess fails at connect time with no hint of what to correct.
     "server_host": "",
     "model": MODEL_LOCAL,
     "local_model": "",

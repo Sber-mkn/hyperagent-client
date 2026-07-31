@@ -22,7 +22,9 @@ def main() -> None:
     args, qt_args = _parse_args(sys.argv[1:])
     app = QApplication([sys.argv[0], *qt_args])
     app.setStyle("Fusion")
-    window = HyperagentClientWindow(data_dir=args.data, work_dir=args.work_dir or pathlib.Path.cwd())
+    window = HyperagentClientWindow(
+        data_dir=args.data, work_dir=args.work_dir or pathlib.Path.cwd()
+    )
     window.show()
     sys.exit(app.exec())
 

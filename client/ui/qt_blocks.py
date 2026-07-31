@@ -1,16 +1,87 @@
 from typing import override
 
 from PyQt6.QtCore import QPointF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPalette, QPen, QTextOption
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
 )
+
+
+class WrappingText(QTextBrowser):
+    """Message body that can never push the window wider than it is.
+
+    QLabel breaks lines at whitespace and nowhere else, so a single long path,
+    URL or blob of JSON raised its minimum width above the window and forced
+    the whole chat to scroll sideways. A text document can be told to break
+    inside a word; the widget then reads its height back from the layout so it
+    still grows downwards like a label rather than scrolling internally.
+
+    Kept API-compatible with QLabel (setText/text) so call sites read the same.
+    """
+
+    def __init__(self, object_name: str = "", markdown: bool = False) -> None:
+        super().__init__()
+        self._markdown = markdown
+        if object_name:
+            self.setObjectName(object_name)
+
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setOpenExternalLinks(True)
+        self.viewport().setAutoFillBackground(False)
+        palette = self.palette()
+        # QLabel прозрачен, а текстовый виджет красит фон сам — в тёмной
+        # теме это была бы светлая плашка.
+        palette.setColor(QPalette.ColorRole.Base, Qt.GlobalColor.transparent)
+        self.setPalette(palette)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # QLabel переносит только по пробелам, и длинный путь или JSON
+        # растягивал окно вбок. Документ умеет рвать внутри слова.
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self.document().setDocumentMargin(0)
+        self._syncing = False
+        self.document().documentLayout().documentSizeChanged.connect(self._sync_height)
+
+    @override
+    def setText(self, text: str) -> None:
+        if self._markdown:
+            self.setMarkdown(text)
+        else:
+            self.setPlainText(text)
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def _sync_height(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            # padding из стилей забирает высоту у видимой области, поэтому
+            # к высоте текста добавляем разницу между виджетом и ней
+            chrome = max(self.height() - self.viewport().height(), 0)
+            self.setFixedHeight(int(self.document().size().height()) + chrome + 1)
+        finally:
+            self._syncing = False
+
+    @override
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_height()
+
+    @override
+    def wheelEvent(self, event) -> None:
+        event.ignore()
 
 
 class PaperPlaneButton(QPushButton):
@@ -96,11 +167,7 @@ class StreamTextBlock(CollapsibleBlock):
     def __init__(self, title: str, text_object_name: str, expanded: bool = True) -> None:
         super().__init__(title, expanded)
         self._text = ""
-        self.text_label = QLabel("")
-        self.text_label.setObjectName(text_object_name)
-        self.text_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.text_label.setWordWrap(True)
-        self.text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.text_label = WrappingText(text_object_name)
         self.body_layout.addWidget(self.text_label)
 
     def append_text(self, text: str) -> None:
@@ -131,22 +198,16 @@ class CommandBlock(QFrame):
         header_layout.addWidget(icon_label)
         header_layout.addWidget(title_label, 1)
 
-        self.command_label = QLabel(command)
-        self.command_label.setObjectName("commandText")
-        self.command_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.command_label.setWordWrap(True)
-        self.command_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.command_label = WrappingText("commandText")
+        self.command_label.setText(command)
 
         self.status_label = QLabel(self._waiting_frames[0])
         self.status_label.setObjectName("commandWaiting")
 
         self.details_block = CollapsibleBlock("Подробнее", expanded=False)
         self.details_block.setObjectName("commandDetails")
-        self.details_label = QLabel(self._format_details(command, cwd, None))
-        self.details_label.setObjectName("commandDetailsText")
-        self.details_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.details_label.setWordWrap(True)
-        self.details_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.details_label = WrappingText("commandDetailsText")
+        self.details_label.setText(self._format_details(command, cwd, None))
         self.details_block.body_layout.addWidget(self.details_label)
 
         layout = QVBoxLayout(self)

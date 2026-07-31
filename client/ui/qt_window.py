@@ -26,9 +26,6 @@ class CommandPermissionRequest:
         self.done = threading.Event()
 
 
-# How long to wait for the backend to confirm the agent is ready before giving
-# up. Connecting itself is already done by this point, so this only covers the
-# backend answering — minutes of image building happen earlier, during login.
 READY_TIMEOUT_MS = 90_000
 
 
@@ -179,7 +176,6 @@ class HyperagentClientWindow(QMainWindow):
         )
 
     def _login(self, server_address: str, login: str, password: str) -> None:
-        # No address means the backend is here, on this machine.
         server_address = server_address.strip() or DEFAULT_SERVER_HOST
         self.controller.set_server_address(server_address)
         self._close_client()
@@ -255,10 +251,7 @@ class HyperagentClientWindow(QMainWindow):
     def _on_login_connected(self, client: RabbitMQClient) -> None:
         self.client = client
         self.controller.attach_client(client)
-        # Connected, but the session only really starts once the backend
-        # answers with ready -- and that answer may never come.
         self._start_ready_timer()
-        # Only now is there a backend to ask which models it can reach.
         self.chat_page.set_model_lister(self.controller.list_models)
         self._apply_settings_to_ui()
         self.consumer_stop_event = threading.Event()
@@ -295,12 +288,9 @@ class HyperagentClientWindow(QMainWindow):
         try:
             self.controller.load_chats()
         except Exception:
-            # A failed load says nothing about whether a new chat can be
-            # started — that is a local action — so the button stays usable
-            # instead of latching off until some later successful load.
             self.chat_list_page.set_chats([], None)
             self.chat_list_page.set_new_chat_enabled(self.controller.can_create_chat())
-            self.chat_page.append_status("Не удалось загрузить чаты.")  # noqa: RUF001
+            self.chat_page.append_status("Не удалось загрузить чаты.")
             return
         self._refresh_chats()
 
@@ -366,7 +356,7 @@ class HyperagentClientWindow(QMainWindow):
             try:
                 self.chat_page.load_history(self.controller.open_chat(chat_id))
             except Exception:
-                self.chat_page.append_status("Не удалось загрузить историю чата.")  # noqa: RUF001
+                self.chat_page.append_status("Не удалось загрузить историю чата.")
         else:
             self.controller.open_chat(chat_id)
         self.chat_page.set_busy(self.controller.has_busy_chats())
@@ -412,7 +402,7 @@ class HyperagentClientWindow(QMainWindow):
         try:
             chat = self.controller.rename_chat(chat_id, new_title)
         except Exception:
-            self.chat_page.append_status("Не удалось переименовать чат.")  # noqa: RUF001
+            self.chat_page.append_status("Не удалось переименовать чат.")
             return
 
         if self.chat_page.chat_id == chat_id:
@@ -457,9 +447,6 @@ class HyperagentClientWindow(QMainWindow):
 
     def _on_agent_message(self, kind: str, message: Any) -> None:
         if not self.logged_in:
-            # Still on the login screen, where no chat is open to append to --
-            # without this the backend's explanation of what it is waiting for
-            # was dropped and the user just watched "Connecting..." forever.
             self.login_page.show_status("" if message is None else str(message))
             return
 
@@ -474,7 +461,7 @@ class HyperagentClientWindow(QMainWindow):
                 try:
                     chat = self.controller.apply_agent_title(chat_id, title)
                 except Exception:
-                    self.chat_page.append_status("Не удалось обновить название чата.")  # noqa: RUF001
+                    self.chat_page.append_status("Не удалось обновить название чата.")
                     return
                 if chat is not None:
                     if self._is_open_chat(chat_id):

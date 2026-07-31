@@ -34,9 +34,8 @@ DEFAULT_WORKDIR = pathlib.Path(os.getenv("CLIENT_WORKDIR", "workdir"))
 DEFAULT_COMMAND_TIMEOUT = 60
 DEFAULT_OUTPUT_LIMIT = 4000
 MAX_OUTPUT_CHARS = 20000
-# The GUI build has no console of its own, so Windows hands every console child
-# a brand new window — which flashes open and shut on the user's screen for each
-# command. Output is captured through pipes either way. Absent off Windows.
+# У GUI-сборки нет своей консоли, поэтому Windows открывает дочернему
+# процессу новое окно — оно мелькает на каждой команде.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 logger = logging.getLogger(__name__)
@@ -116,7 +115,7 @@ def _tool_error(text: str) -> dict[str, Any]:
 def parse_client_command(command: Any) -> tuple[str, dict[str, Any]]:
     """The agent addresses a client-side tool by name, passing the model's raw
     JSON arguments: {"name": "run_bash", "arguments": '{"command": "ls"}'}."""
-    if isinstance(command, str):  # older agent builds sent a bare shell string
+    if isinstance(command, str):
         return "run_bash", {"command": command}
     if not isinstance(command, dict):
         return "", {}
@@ -317,8 +316,6 @@ class RabbitMQClient(RabbitMQBase):
                     command_info,
                 )
                 if name == "ask_user":
-                    # Asking a question runs nothing on the machine, so it is
-                    # not subject to the command-execution access level.
                     response = self._ask_user(command_info["command"])
                 elif self._can_run_command(command_info):
                     response = self._execute_client_tool(name, arguments, work_dir)
@@ -382,18 +379,12 @@ class RabbitMQClient(RabbitMQBase):
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
-                # Both shells we launch speak UTF-8. Without saying so, Python
-                # decodes with the system code page — on a Russian Windows that
-                # turned "июл 28" into "РёСЋР» 28" in everything the agent read.
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
                 creationflags=NO_WINDOW,
-                # Nobody is at a keyboard here. Without this the child inherits
-                # whatever handle the client happens to have: an invalid one in
-                # the GUI build (instant EOF), a real terminal in a console run
-                # — where a script waiting for input would hang the whole
-                # command until it timed out.
+                # Терминала нет, за клавиатурой никого: input() должен сразу
+                # получить EOF, а не висеть до таймаута.
                 stdin=subprocess.DEVNULL,
             )
         except FileNotFoundError:
@@ -425,12 +416,9 @@ class RabbitMQClient(RabbitMQBase):
 
         try:
             if platform.system() == "Windows":
-                # Passed as one raw command line on purpose: given a list, Python
-                # escapes inner quotes the C way (\") and cmd does not read them
-                # back, so `python "app with space.py"` and `python -c "..."`
-                # both break. `pause` keeps the window up after the program
-                # exits, so its last output stays readable.
                 subprocess.Popen(
+                    # Одной строкой, не списком: иначе Python экранирует кавычки
+                    # по-своему, и cmd их не понимает.
                     f'cmd /c "{command} & echo. & pause"',
                     cwd=work_dir,
                     creationflags=subprocess.CREATE_NEW_CONSOLE,
@@ -475,9 +463,8 @@ class RabbitMQClient(RabbitMQBase):
     def _reconnect_to_personal(self, credentials: dict):
         self.connection.close()
 
-        # The personal queue normally lives on the same machine the client just
-        # logged in to, so reuse that address; the server only names a host when
-        # its queues really sit elsewhere.
+        # Очередь обычно на той же машине, куда логинились, поэтому берём
+        # её адрес; сервер называет хост, только если очереди вынесены.
         host = str(credentials.get("rabbitmq_host") or self._router_host)
         port = int(credentials["rabbitmq_port"])
         personal_url = (
@@ -496,10 +483,6 @@ class RabbitMQClient(RabbitMQBase):
         self._rpc_host = host
         self._rpc_port = port
 
-        # Consuming is started by start_consuming() in the consumer thread.
-        # Subscribing here too left two consumers on one queue, so deliveries
-        # were split between them round-robin for no reason. Nothing is lost in
-        # the gap: client_queue is durable and holds messages until then.
         logger.info("Connected to personal RabbitMQ at %s:%s", host, port)
 
     def send_logout(self):

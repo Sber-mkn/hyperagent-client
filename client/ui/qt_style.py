@@ -40,7 +40,7 @@ def stylesheet(theme: str = "dark") -> str:
         border-radius: 8px;
     }
 
-    #settingsBody, #chatBody, #agentScroll, #agentOutput {
+    #settingsBody, #settingsScroll, #chatBody, #agentScroll, #agentOutput {
         background: #f4f6f8;
     }
 
@@ -326,7 +326,7 @@ def stylesheet(theme: str = "dark") -> str:
         color: #858a94;
     }
 
-    #settingsBody {
+    #settingsBody, #settingsScroll {
         background: #18191b;
     }
 

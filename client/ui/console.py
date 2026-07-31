@@ -98,8 +98,6 @@ class ConsoleClientUI:
 
     @staticmethod
     def request_user_answer(question: str) -> str:
-        # Safe to read stdin here: input_loop is parked on ready_event for as
-        # long as the agent is working on the task that asked this question.
         print(f"\n\n[Вопрос агента] {question}")
         try:
             return input("> ").strip()
